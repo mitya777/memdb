@@ -1,0 +1,36 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "memdb-openai",
+  "version": "0.1.0",
+  "description": "Shared durable memory (memdb) for OpenAI agents, with signed and Bitcoin SV-anchored provenance on every write.",
+  "author": {
+    "name": "Dmitriy Fabrikant",
+    "url": "https://github.com/mitya777/memdb"
+  },
+  "homepage": "https://github.com/mitya777/memdb",
+  "repository": "https://github.com/mitya777/memdb",
+  "keywords": ["memory", "mcp", "provenance", "bsv"],
+  "extensions": {
+    "com.openai": {
+      "interface": {
+        "displayName": "memdb",
+        "shortDescription": "Shared agent memory with provable provenance",
+        "longDescription": "Recall, search and save durable memories (decisions, preferences, lessons, commitments) in a memdb store shared with other agents. Every memory saved through this plugin gets a provenance record signed by the memdb server and anchored in a Bitcoin SV transaction. The source is set by the server from the connection (OpenAI's connector client certificate), not by the model. The proof covers the channel, the time and integrity. It does not cover which model wrote the text.",
+        "developerName": "Dmitriy Fabrikant",
+        "category": "Productivity",
+        "capabilities": [
+          "Recall durable memories",
+          "Search shared memory",
+          "Save memories with signed provenance",
+          "Export a memory's proof bundle"
+        ],
+        "websiteURL": "https://github.com/mitya777/memdb",
+        "defaultPrompt": [
+          "What have we decided about anchoring memory provenance?",
+          "Save this as a decision: memdb provenance anchors go to BSV.",
+          "Show me the proof for memory 42."
+        ]
+      }
+    }
+  }
+}
