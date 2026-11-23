@@ -1145,19 +1145,17 @@ def cmd_recent(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_query(args: argparse.Namespace) -> int:
-    con = connect(args.db)
-    init_db(con)
-
-    raw_query = (args.query or "").strip()
-    if not raw_query:
-        print("--query is required", file=sys.stderr)
-        return 2
-
-    scope = _resolve_scope_from_args(args)
-    limit = max(1, int(args.n))
-    include_events = bool(getattr(args, "include_events", False))
-
+def query_items(
+    con: sqlite3.Connection,
+    raw_query: str,
+    *,
+    scope: dict[str, Optional[str]],
+    limit: int = 10,
+    include_events: bool = False,
+) -> list[dict[str, Any]]:
+    """FTS search over messages (and optionally events). Returns recall dicts."""
+    raw_query = (raw_query or "").strip()
+    limit = max(1, int(limit))
     fts_query = raw_query
     msg_where, msg_scope_params = _build_message_scope_sql(scope, alias="m")
     if not msg_where:
@@ -1237,60 +1235,99 @@ def cmd_query(args: argparse.Namespace) -> int:
     except sqlite3.OperationalError:
         compiled = _compile_fts_query(raw_query)
         if not compiled:
-            print(json.dumps({"query": raw_query, "scope": _serialize_scope(scope), "results": []}, indent=2))
-            return 0
+            return []
         rows = run_query(compiled)
+    return [_row_to_recall_result(r) for r in rows]
 
+
+def cmd_query(args: argparse.Namespace) -> int:
+    con = connect(args.db)
+    init_db(con)
+
+    raw_query = (args.query or "").strip()
+    if not raw_query:
+        print("--query is required", file=sys.stderr)
+        return 2
+
+    scope = _resolve_scope_from_args(args)
+    results = query_items(
+        con,
+        raw_query,
+        scope=scope,
+        limit=int(args.n),
+        include_events=bool(getattr(args, "include_events", False)),
+    )
     payload = {
         "query": raw_query,
         "scope": _serialize_scope(scope),
-        "results": [_row_to_recall_result(r) for r in rows],
+        "results": results,
     }
     print(json.dumps(payload, indent=2, ensure_ascii=False))
     return 0
 
 
-def cmd_learn(args: argparse.Namespace) -> int:
-    con = connect(args.db)
-    init_db(con)
+class LearnError(ValueError):
+    """Invalid input to record_learned (maps to CLI exit code 2)."""
 
-    title = (args.title or "").strip()
+
+def record_learned(
+    con: sqlite3.Connection,
+    *,
+    memory_type: str,
+    title: str,
+    summary: Optional[str] = None,
+    key: Optional[str] = None,
+    priority: Optional[str] = None,
+    tags: Any = None,
+    source_refs: Any = None,
+    evidence: Any = None,
+    session_id: Optional[str] = None,
+    session_key: Optional[str] = None,
+    chat_app: Optional[str] = None,
+    chat_id: Optional[str] = None,
+    thread_id: Optional[str] = None,
+    origin_message_id: Optional[int] = None,
+    timestamp: Optional[str] = None,
+    commit: bool = True,
+) -> dict[str, Any]:
+    """Append one explicit `learned` event. Returns a summary dict.
+
+    Shared by the `learn` CLI command and the OpenAI MCP plugin. Never
+    updates existing rows.
+    """
+    title = (title or "").strip()
     if not title:
-        print("--title is required", file=sys.stderr)
-        return 2
+        raise LearnError("--title is required")
 
     ts_ms = int(dt.datetime.now(dt.timezone.utc).timestamp() * 1000)
-    if args.timestamp:
-        ts_ms = _utc_ms_from_iso(args.timestamp)
+    if timestamp:
+        ts_ms = _utc_ms_from_iso(timestamp)
         if ts_ms <= 0:
-            print(f"Invalid --timestamp: {args.timestamp}", file=sys.stderr)
-            return 2
+            raise LearnError(f"Invalid --timestamp: {timestamp}")
 
-    memory_type = (args.memory_type or "").strip().lower()
+    memory_type = (memory_type or "").strip().lower()
     if memory_type not in LEARNED_MEMORY_TYPES:
-        print(f"Unsupported --type: {memory_type}", file=sys.stderr)
-        return 2
+        raise LearnError(f"Unsupported --type: {memory_type}")
 
-    summary = (args.summary or title).strip()
-    key = _slugify((args.key or title).strip())
-    tags = _normalize_string_list(args.tag)
-    source_refs = _normalize_string_list(args.source_ref)
-    evidence = _normalize_string_list(args.evidence)
-    priority = (args.priority or "").strip().lower() or _default_priority_for_memory_type(memory_type)
+    summary = (summary or title).strip()
+    key = _slugify((key or title).strip())
+    tags = _normalize_string_list(tags)
+    source_refs = _normalize_string_list(source_refs)
+    evidence = _normalize_string_list(evidence)
+    priority = (priority or "").strip().lower() or _default_priority_for_memory_type(memory_type)
     if priority not in ("red", "yellow", "green"):
-        print(f"Unsupported --priority: {priority}", file=sys.stderr)
-        return 2
+        raise LearnError(f"Unsupported --priority: {priority}")
 
     conversation: dict[str, str] = {}
-    if args.chat_app:
-        conversation["chat_app"] = args.chat_app.strip()
-    if args.chat_id:
-        conversation["chat_id"] = args.chat_id.strip()
-    if args.thread_id:
-        conversation["thread_id"] = args.thread_id.strip()
-    if args.session_key:
+    if chat_app:
+        conversation["chat_app"] = chat_app.strip()
+    if chat_id:
+        conversation["chat_id"] = chat_id.strip()
+    if thread_id:
+        conversation["thread_id"] = thread_id.strip()
+    if session_key:
         derived_app, derived_chat_id, derived_thread_id = _coalesce_scope_from_session_key(
-            args.session_key,
+            session_key,
             chat_app=conversation.get("chat_app"),
             chat_id=conversation.get("chat_id"),
             thread_id=conversation.get("thread_id"),
@@ -1313,10 +1350,10 @@ def cmd_learn(args: argparse.Namespace) -> int:
         "source_refs": source_refs,
         "evidence": evidence,
     }
-    if args.session_id:
-        payload["session_id"] = args.session_id.strip()
-    if args.session_key:
-        payload["session_key"] = args.session_key.strip()
+    if session_id:
+        payload["session_id"] = session_id.strip()
+    if session_key:
+        payload["session_key"] = session_key.strip()
     if conversation:
         payload["conversation"] = conversation
 
@@ -1331,9 +1368,9 @@ def cmd_learn(args: argparse.Namespace) -> int:
         source_file=_synthetic_learned_source_file(ts_ms),
         source_line=int(ts_ms % 2_147_483_647) or 1,
         ts_ms=ts_ms,
-        session_id=(args.session_id or "").strip() or None,
-        session_key=(args.session_key or "").strip() or None,
-        origin_message_id=args.origin_message_id,
+        session_id=(session_id or "").strip() or None,
+        session_key=(session_key or "").strip() or None,
+        origin_message_id=origin_message_id,
         kind="learned",
         name=memory_type,
         input_json=payload,
@@ -1345,21 +1382,45 @@ def cmd_learn(args: argparse.Namespace) -> int:
             "payload": payload,
         },
     )
-    con.commit()
+    if commit:
+        con.commit()
 
-    print(
-        json.dumps(
-            {
-                "id": event_id,
-                "kind": "learned",
-                "memory_type": memory_type,
-                "key": key,
-                "title": title,
-                "source_file": _synthetic_learned_source_file(ts_ms),
-            },
-            indent=2,
+    return {
+        "id": event_id,
+        "kind": "learned",
+        "memory_type": memory_type,
+        "key": key,
+        "title": title,
+        "source_file": _synthetic_learned_source_file(ts_ms),
+    }
+
+
+def cmd_learn(args: argparse.Namespace) -> int:
+    con = connect(args.db)
+    init_db(con)
+    try:
+        result = record_learned(
+            con,
+            memory_type=args.memory_type,
+            title=args.title,
+            summary=args.summary,
+            key=args.key,
+            priority=args.priority,
+            tags=args.tag,
+            source_refs=args.source_ref,
+            evidence=args.evidence,
+            session_id=args.session_id,
+            session_key=args.session_key,
+            chat_app=args.chat_app,
+            chat_id=args.chat_id,
+            thread_id=args.thread_id,
+            origin_message_id=args.origin_message_id,
+            timestamp=args.timestamp,
         )
-    )
+    except LearnError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    print(json.dumps(result, indent=2))
     return 0
 
 
